@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Oracle → PostgreSQL DDL Converter</title>
+  <style>
+    :root { --bg:#0f172a; --panel:#111827; --ink:#e5e7eb; --muted:#9ca3af; --accent:#22d3ee; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background:var(--bg); color:var(--ink); }
+    header { padding:24px; border-bottom:1px solid #1f2937; display:flex; align-items:center; gap:12px; }
+    header h1 { font-size:20px; margin:0; }
+    .wrap { max-width:1100px; margin:0 auto; padding:20px; }
+    .grid { display:grid; grid-template-columns: 1fr; gap:16px; }
+    @media (min-width: 1000px) { .grid { grid-template-columns: 1fr 1fr; } }
+    textarea { width:100%; height:520px; background:#0b1022; color:var(--ink); border:1px solid #1f2937; border-radius:12px; padding:14px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size:13px; line-height:1.5; }
+    .panel { background:var(--panel); border:1px solid #1f2937; border-radius:14px; padding:14px; }
+    .btns { display:flex; flex-wrap:wrap; gap:10px; margin-top:10px; }
+    button { background:#111827; color:var(--ink); border:1px solid #374151; padding:10px 14px; border-radius:10px; cursor:pointer; font-weight:600; }
+    button.primary { background:linear-gradient(180deg,#1fb6ff,#0891b2); border:none; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    .hint { color:var(--muted); font-size:12px; margin-top:8px; }
+    .badge { display:inline-block; background:#0b1022; border:1px solid #1f2937; padding:2px 8px; border-radius:999px; font-size:11px; color:#cbd5e1; }
+    .rowtitle{ display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+    footer{ text-align:center; color:#94a3b8; font-size:12px; padding:20px; }
+    .stat{ color:#a7f3d0; font-size:12px; margin-left:8px; }
+    .toolbar{ display:flex; align-items:center; gap:12px; margin-top:8px; }
+    label.switch{ display:flex; align-items:center; gap:6px; font-size:12px; color:#d1d5db; }
+    input[type="checkbox"]{ accent-color:#22d3ee; width:16px; height:16px; }
+  </style>
+</head>
+<body>
+  <header>
+    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 7h18M3 12h18M3 17h18" stroke="#22d3ee" stroke-width="2" stroke-linecap="round"/></svg>
+    <h1>Oracle → PostgreSQL DDL Converter</h1>
+    <span class="badge" id="modeBadge">Identifiers: unquoted lower_case</span>
+  </header>
+
+  <div class="wrap">
+    <div class="grid">
+      <div class="panel">
+        <div class="rowtitle"><strong>Input: Oracle 9i DDL / DML</strong></div>
+        <textarea id="oracle" placeholder="Paste Oracle CREATE/ALTER/DROP + INSERT/UPDATE/DELETE statements. Multiple statements supported."></textarea>
+        <div class="btns">
+          <button class="primary" id="convertBtn">Convert ⮕ PostgreSQL</button>
+          <button id="exampleBtn">Load example</button>
+          <button id="clearBtn">Clear</button>
+        </div>
+        <div class="toolbar">
+          <label class="switch"><input type="checkbox" id="preserveToggle"/> Preserve UPPERCASE (quoted)</label>
+        </div>
+        <div class="hint">Toggle controls identifier style. Off = lowercase, unquoted (PostgreSQL‑idiomatic). On = ORIGINAL UPPERCASE, quoted.</div>
+      </div>
+      <div class="panel">
+        <div class="rowtitle"><strong>Output: PostgreSQL</strong> <span id="stat" class="stat"></span></div>
+        <textarea id="pg" placeholder="Converted PostgreSQL SQL will appear here"></textarea>
+        <div class="btns">
+          <button id="copyBtn">Copy</button>
+          <button id="beautifyBtn">Beautify</button>
+          <button id="downloadBtn">Download .sql</button>
+        </div>
+        <div class="hint">Review numeric precision/scale and FK ON DELETE/UPDATE. Validate before production.</div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <strong>Notes & assumptions</strong>
+      <ul>
+        <li>NUMBER(p,s) → NUMERIC(p,s). NUMBER(p) → SMALLINT if p ≤ 4, INTEGER if 5–9, else NUMERIC(p). Bare NUMBER → NUMERIC.</li>
+        <li>VARCHAR2 → VARCHAR, NVARCHAR2 → VARCHAR, CHAR → CHAR. DATE → DATE. TIMESTAMP → TIMESTAMP WITHOUT TIME ZONE.</li>
+        <li>CLOB → TEXT, BLOB/RAW → BYTEA. SYSDATE/SYSTIMESTAMP defaults mapped to CURRENT_DATE/CURRENT_TIMESTAMP.</li>
+        <li>Strips TABLESPACE/STORAGE/USING INDEX/ENABLE|DISABLE/SEGMENT CREATION/etc.</li>
+        <li>FKs: quotes ref table/cols when quoting mode is on; otherwise lowercases unquoted.</li>
+        <li>DML (INSERT/UPDATE/DELETE): table names normalized per the toggle.</li>
+      </ul>
+    </div>
+  </div>
+
+  <footer>MIT-style, no warranty. Validate output before production.</footer>
+
+<script>
+let preserveUpper = false; // default: lowercase unquoted
+
+function setModeBadge(){
+  const b = document.getElementById('modeBadge');
+  b.textContent = preserveUpper ? 'Preserve UPPERCASE (quoted)' : 'Identifiers: unquoted lower_case';
+}
+
+document.getElementById('preserveToggle').addEventListener('change', (e)=>{
+  preserveUpper = e.target.checked;
+  setModeBadge();
+});
+
+function toUnixNewlines(s){return s.replace(/\r\n?/g,"\n");}
+
+function stripOracleStorageBits(sql){
+  let s = sql;
+  const patterns = [
+    /\bTABLESPACE\b[^,\)\;]*/gi, /\bPCTFREE\b[^,\)\;]*/gi, /\bPCTUSED\b[^,\)\;]*/gi,
+    /\bINITRANS\b[^,\)\;]*/gi, /\bMAXTRANS\b[^,\)\;]*/gi,
+    /\bSTORAGE\b\s*\([^\)]*\)/gi, /\bUSING\s+INDEX\b[^,\)\;]*/gi,
+    /\bENABLE\b/gi, /\bDISABLE\b/gi, /\bSEGMENT\s+CREATION\b[^,\)\;]*/gi,
+    /\bLOGGING\b/gi, /\bNOCOMPRESS\b/gi, /\bCOMPRESS\b/gi,
+    /\bPARALLEL\b[^,\)\;]*/gi, /\bNOPARALLEL\b/gi
+  ];
+  for(const p of patterns){ s = s.replace(p, ""); }
+  return s;
+}
+
+function mapTypes(s){
+  let out = s;
+  out = out.replace(/\bTIMESTAMP\b\s*(?:\(\s*\d+\s*\))?/gi, 'TIMESTAMP WITHOUT TIME ZONE');
+  out = out.replace(/\bDATE\b/gi, 'DATE');
+  out = out.replace(/\bCLOB\b/gi, 'TEXT');
+  out = out.replace(/\bBLOB\b/gi, 'BYTEA');
+  out = out.replace(/\bRAW\b(?:\s*\(\s*\d+\s*\))?/gi, 'BYTEA');
+  out = out.replace(/\bNVARCHAR2\s*\((\s*\d+\s*)\)/gi, 'VARCHAR($1)');
+  out = out.replace(/\bNCHAR\s*\((\s*\d+\s*)\)/gi, 'CHAR($1)');
+  out = out.replace(/\bVARCHAR2\s*\((\s*\d+\s*)\)/gi, 'VARCHAR($1)');
+  out = out.replace(/\bNUMBER\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)/gi, 'NUMERIC($1,$2)');
+  out = out.replace(/\bNUMBER\s*\(\s*(\d+)\s*\)/gi, (m, p1) => {
+    const p = parseInt(p1,10);
+    if (p <= 4) return 'SMALLINT';
+    if (p <= 9) return 'INTEGER';
+    return `NUMERIC(${p})`;
+  });
+  out = out.replace(/\bNUMBER\b(?!\s*\()/gi, 'NUMERIC');
+  return out;
+}
+
+function mapDefaults(s){
+  let out = s;
+  out = out.replace(/DEFAULT\s+SYSDATE/gi, 'DEFAULT CURRENT_DATE');
+  out = out.replace(/DEFAULT\s+SYSTIMESTAMP/gi, 'DEFAULT CURRENT_TIMESTAMP');
+  return out;
+}
+
+function quoteIdent(name){
+  const already = /^\s*"[\s\S]*"\s*$/.test(name);
+  if (already) return name.trim();
+  const clean = name.trim().replace(/^`|`$/g, '');
+  return preserveUpper ? '"' + clean.toUpperCase() + '"' : clean.toLowerCase();
+}
+
+function quoteSchemaTable(name){
+  const parts = name.split('.');
+  return parts.map(p=>quoteIdent(p.replace(/^"|"$/g,''))).join('.');
+}
+
+function normalizeCreateTableName(sql){
+  return sql.replace(/(CREATE\s+TABLE\s+)([\w\."]+)(\s*\()/gi, (m, p1, name, p3)=> p1 + quoteSchemaTable(name) + p3);
+}
+
+function normalizeAlterDropTableNames(sql){
+  return sql
+    .replace(/(ALTER\s+TABLE\s+)([\w\."]+)/gi, (m,p1,n)=> p1 + quoteSchemaTable(n))
+    .replace(/(DROP\s+TABLE\s+)(IF\s+EXISTS\s+)?([\w\."]+)/gi, (m,p1,p2,n)=> (p1 + (p2||'') + quoteSchemaTable(n)));
+}
+
+function normalizeCRUDTableNames(sql){
+  // INSERT INTO, UPDATE, DELETE FROM
+  return sql
+    .replace(/(INSERT\s+INTO\s+)([\w\."]+)/gi, (m,p1,n)=> p1 + quoteSchemaTable(n))
+    .replace(/(UPDATE\s+)([\w\."]+)/gi, (m,p1,n)=> p1 + quoteSchemaTable(n))
+    .replace(/(DELETE\s+FROM\s+)([\w\."]+)/gi, (m,p1,n)=> p1 + quoteSchemaTable(n));
+}
+
+function quoteConstraintLists(sql){
+  // PRIMARY/UNIQUE/FOREIGN KEY (col, col2)
+  return sql.replace(/(PRIMARY\s+KEY|UNIQUE|FOREIGN\s+KEY)\s*\(([^\)]*)\)/gi, (m, kw, list) => {
+    const newList = list.split(',').map(x => {
+      const t = x.trim();
+      if (/\(|\)/.test(t)) return t;
+      return quoteIdent(t.replace(/^"|"$/g, ''));
+    }).join(', ');
+    return `${kw} (${newList})`;
+  });
+}
+
+function quoteConstraintNames(sql){
+  return sql.replace(/(CONSTRAINT)\s+([\w\"]+)/gi, (m, kw, nm) => `${kw} ${quoteIdent(nm)}`);
+}
+
+function quoteReferences(sql){
+  // REFERENCES schema.table (cols)
+  return sql.replace(/(REFERENCES)\s+([\w\."]+)\s*\(([^\)]*)\)/gi, (m, kw, tbl, cols) => {
+    const qt = quoteSchemaTable(tbl);
+    const qcols = cols.split(',').map(c=>{
+      const t = c.trim();
+      if(!t) return t;
+      return quoteIdent(t.replace(/^"|"$/g, ''));
+    }).join(', ');
+    return `${kw} ${qt} (${qcols})`;
+  });
+}
+
+function quoteColumnNamesInCreate(sql){
+  // Only the first balanced parens after CREATE TABLE ... (
+  return sql.replace(/(CREATE\s+TABLE\s+[\w\."]+\s*)\(([\s\S]*?)\)/mi, (m, prefix, inner) => {
+    const lines = inner.split(/\n/);
+    const converted = lines.map(line => {
+      const trimmed = line.trim();
+      if (!trimmed) return line;
+      if (/^(CONSTRAINT|PRIMARY|FOREIGN|UNIQUE|CHECK)\b/i.test(trimmed)) return line;
+      const match = trimmed.match(/^([\w\"]+)(\s+[\s\S]*)$/);
+      if (!match) return line;
+      const col = match[1];
+      const rest = match[2] || '';
+      const quoted = quoteIdent(col);
+      const leading = line.match(/^\s*/)[0];
+      return leading + quoted + rest;
+    }).join('\n');
+    return prefix + '(' + converted + ')';
+  });
+}
+
+function tidy(sql){
+  let s = sql
+    .replace(/\s+,/g, ',')
+    .replace(/,\s*\)/g, ')')
+    .replace(/\)\s*;/g, ');')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[ \t]+$/gm, '');
+  if(!/;\s*$/.test(s.trim())) s = s.trim() + ';\n';
+  return s;
+}
+
+function beautify(sql){
+  return toUnixNewlines(sql)
+    .replace(/\bCREATE\b/gi, 'CREATE')
+    .replace(/\bTABLE\b/gi, 'TABLE')
+    .replace(/\bCONSTRAINT\b/gi, 'CONSTRAINT')
+    .replace(/\bPRIMARY KEY\b/gi, 'PRIMARY KEY')
+    .replace(/\bFOREIGN KEY\b/gi, 'FOREIGN KEY')
+    .replace(/\bREFERENCES\b/gi, 'REFERENCES')
+    .replace(/\bUNIQUE\b/gi, 'UNIQUE')
+    .replace(/\(/g, '(\n  ')
+    .replace(/,\s*/g, ',\n  ')
+    .replace(/\)\s*;/g, '\n);');
+}
+
+function convertOracleToPostgresSingle(stmt){
+  let sql = toUnixNewlines(stmt).trim();
+  if(!sql) return '';
+  sql = stripOracleStorageBits(sql);
+  sql = mapDefaults(sql);
+  sql = mapTypes(sql);
+  // DDL specifics
+  sql = normalizeCreateTableName(sql);
+  sql = quoteColumnNamesInCreate(sql);
+  sql = quoteConstraintLists(sql);
+  sql = quoteConstraintNames(sql);
+  sql = quoteReferences(sql);
+  sql = normalizeAlterDropTableNames(sql);
+  // DML specifics
+  sql = normalizeCRUDTableNames(sql);
+  sql = tidy(sql);
+  return sql;
+}
+
+function splitStatements(sql){
+  const s = toUnixNewlines(sql);
+  const out = [];
+  let buf = '';
+  let depth = 0; // parentheses depth
+  let inStr = false; let strChar = '';
+  for(let i=0;i<s.length;i++){
+    const c = s[i];
+    const prev = i>0 ? s[i-1] : '';
+    if(inStr){
+      buf += c;
+      if(c === strChar && prev !== '\\') inStr = false;
+      continue;
+    }
+    if(c === '\'' || c === '"'){
+      inStr = true; strChar = c; buf += c; continue;
+    }
+    if(c === '(') { depth++; buf += c; continue; }
+    if(c === ')') { depth = Math.max(0, depth-1); buf += c; continue; }
+    if(c === ';' && depth === 0){
+      if(buf.trim()) out.push(buf.trim());
+      buf = '';
+      continue;
+    }
+    buf += c;
+  }
+  if(buf.trim()) out.push(buf.trim());
+  return out;
+}
+
+function convertOracleToPostgres(input){
+  if(!input) return '';
+  const stmts = splitStatements(input);
+  const converted = stmts.map(convertOracleToPostgresSingle).filter(Boolean);
+  return converted.join('\n\n');
+}
+
+// UI wiring
+const $ = (sel)=>document.querySelector(sel);
+setModeBadge();
+$('#convertBtn').addEventListener('click', ()=>{
+  const out = convertOracleToPostgres($('#oracle').value);
+  $('#pg').value = out;
+  const count = splitStatements($('#oracle').value).length;
+  $('#stat').textContent = count ? `${count} statement(s) converted` : '';
+});
+$('#copyBtn').addEventListener('click', async ()=>{
+  const t = $('#pg').value; if(!t) return; await navigator.clipboard.writeText(t);
+  const btn = $('#copyBtn'); const old = btn.textContent; btn.textContent = 'Copied!'; setTimeout(()=>btn.textContent=old, 1200);
+});
+$('#clearBtn').addEventListener('click', ()=>{ $('#oracle').value=''; $('#pg').value=''; $('#stat').textContent=''; });
+$('#beautifyBtn').addEventListener('click', ()=>{ $('#pg').value = beautify($('#pg').value); });
+$('#downloadBtn').addEventListener('click', ()=>{
+  const t = $('#pg').value || '';
+  const blob = new Blob([t], {type: 'text/sql'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'converted.sql';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
+});
+$('#exampleBtn').addEventListener('click', ()=>{
+  $('#oracle').value = `CREATE TABLE SUPPLIER_BANK_DETAILS ( 
+  SUPPLIER_CODE      NUMBER (6)    NOT NULL, 
+  SUB_LOCATION_CODE  VARCHAR2 (5)  NOT NULL, 
+  NAME               VARCHAR2 (250), 
+  EFF_DTE            DATE          NOT NULL, 
+  PAN_NUMBER         VARCHAR2 (12), 
+  ACCOUNT_NUM        VARCHAR2 (20)  NOT NULL, 
+  IFSC_CODE          VARCHAR2 (15), 
+  BANK_NAME          VARCHAR2 (50)  NOT NULL, 
+  ADDRESS            VARCHAR2 (100), 
+  CITY               VARCHAR2 (20), 
+  STATE_CODE         NUMBER (2), 
+  CREATED_BY         VARCHAR2 (50), 
+  CREATED_DTE        DATE, 
+  MAIL_ID            VARCHAR2 (50), 
+  SUPPLIER_NAME      VARCHAR2 (1000), 
+  AGM_AUTH           CHAR (1)      DEFAULT 'N', 
+  AAO_AUTH           CHAR (1)      DEFAULT 'N', 
+  FILE_NAME          VARCHAR2 (50), 
+  CONSTRAINT SUP_BANK_PK PRIMARY KEY ( SUPPLIER_CODE, SUB_LOCATION_CODE, EFF_DTE ),
+  CONSTRAINT SUP_BANK_FK1 FOREIGN KEY ( SUB_LOCATION_CODE ) REFERENCES LOCATIONS ( SUB_LOCATION_CODE ) ON DELETE CASCADE
+);
+
+INSERT INTO SUPPLIER_BANK_DETAILS (SUPPLIER_CODE, SUB_LOCATION_CODE, NAME) VALUES (1, 'HOO1', 'Acme');
+UPDATE SUPPLIER_BANK_DETAILS SET NAME='Acme Ltd' WHERE SUPPLIER_CODE=1;
+DELETE FROM SUPPLIER_BANK_DETAILS WHERE SUPPLIER_CODE=1;
+
+CREATE TABLE LOCATIONS (
+  SUB_LOCATION_CODE VARCHAR2(5) NOT NULL,
+  NAME VARCHAR2(100),
+  CONSTRAINT LOC_PK PRIMARY KEY (SUB_LOCATION_CODE)
+);
+ALTER TABLE SUPPLIER_BANK_DETAILS ADD CONSTRAINT SUP_BANK_FK2 FOREIGN KEY (SUB_LOCATION_CODE) REFERENCES LOCATIONS (SUB_LOCATION_CODE);
+DROP TABLE TEMP_SUPPLIERS;`;
+});
+</script>
+</body>
+</html>
